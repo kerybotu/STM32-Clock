@@ -32,8 +32,22 @@
 #define SDA_L() (GPIOA_ODR &= ~(1<<10))
 #define SDA_READ() ((GPIOA_IDR & (1<<10)) ? 1 : 0)
 #define I2C_DELAY_COUNT 20
+#define BUTTON_WAKE_MASK (1u << 0)
+#define BUTTON_SET_MASK  (1u << 4)
 
 void delay(volatile uint32_t count) { while(count--); }
+
+static uint8_t ButtonDown(uint32_t mask) {
+    return (GPIOA_IDR & mask) == 0;
+}
+
+static uint8_t ButtonPressed(uint32_t mask) {
+    if (!ButtonDown(mask)) return 0;
+    delay(3000);
+    if (!ButtonDown(mask)) return 0;
+    while (ButtonDown(mask)) delay(1000);
+    return 1;
+}
 
 const uint8_t Font6x8[15][6] = {
     {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
@@ -250,10 +264,12 @@ uint8_t RTC_Init_LSE(void) {
 
 int main(void) {
     RCC_IOPENR |= (1 << 0);
-    GPIOA_MODER &= ~(3 << 2); GPIOA_MODER |= (1 << 2);
+    GPIOA_MODER &= ~((3u << 0) | (3u << 2) | (3u << 8));
+    GPIOA_MODER |= (1u << 2);       // PA1 LED 输出
     GPIOA_MODER &= ~((3 << 18) | (3 << 20)); GPIOA_MODER |= ((1 << 18) | (1 << 20));
     GPIOA_OTYPER |= (1 << 9) | (1 << 10);
-    GPIOA_PUPDR  &= ~((3 << 18) | (3 << 20)); GPIOA_PUPDR |= ((1 << 18) | (1 << 20));
+    GPIOA_PUPDR  &= ~((3u << 0) | (3u << 8) | (3u << 18) | (3u << 20));
+    GPIOA_PUPDR  |= (1u << 0) | (1u << 8) | (1u << 18) | (1u << 20);
 
     for(volatile int i = 0; i < 2000000; i++);
 
