@@ -41,7 +41,41 @@ static uint8_t ButtonDown(uint32_t mask) {
     return (GPIOA_IDR & mask) == 0;
 }
 
-Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
+const uint8_t Font6x8[15][6] = {
+    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
+    {0x7F,0x40,0x40,0x40,0x40}, {0x3E,0x41,0x49,0x49,0x32}, {0x7F,0x49,0x49,0x49,0x41},
+    {0x00,0x60,0x60,0x00,0x00}
+};
+
+void I2C_Start() { SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT); SDA_L(); delay(I2C_DELAY_COUNT); SCL_L(); }
+void I2C_Stop()  { SCL_L(); SDA_L(); delay(I2C_DELAY_COUNT); SCL_H(); delay(I2C_DELAY_COUNT); SDA_H(); }
+uint8_t I2C_WriteByte(uint8_t dat) {
+    for(uint8_t i=0; i<8; i++) {
+        if(dat & 0x80) SDA_H(); else SDA_L();
+        SCL_H(); delay(I2C_DELAY_COUNT); SCL_L(); delay(I2C_DELAY_COUNT);
+        dat <<= 1;
+    }
+    SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT);
+    uint8_t ack = SDA_READ();
+    SCL_L(); delay(I2C_DELAY_COUNT);
+    return ack;
+}
+void OLED_WriteCmd(uint8_t cmd) {
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x00); I2C_WriteByte(cmd); I2C_Stop();
+}
+void OLED_WriteData(uint8_t data) {
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40); I2C_WriteByte(data); I2C_Stop();
+}
+void OLED_WriteDataBuffer(const uint8_t *data, uint8_t length) {
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
+    while (length--) I2C_WriteByte(*data++);
+    I2C_Stop();
+}
+void OLED_WriteDataFill(uint8_t value, uint8_t length) {
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
     while (length--) I2C_WriteByte(value);
     I2C_Stop();
 }
@@ -244,5 +278,4 @@ int main(void) {
         else if(setting&&ev){if(ev==1){if(item==0)y=(y>=99)?0:y+1;else if(item==1)mo=(mo>=12)?1:mo+1;else if(item==2){uint8_t mx=DateDays(y,mo);da=(da>=mx)?1:da+1;}else if(item==3)wd=(wd>=7)?1:wd+1;else if(item==4)h=(h>=23)?0:h+1;else mi=(mi>=59)?0:mi+1;RTC_WriteCalendar(y,mo,da,wd,h,mi);}else if(item>=5){setting=0;item=0;RTC_WriteCalendar(y,mo,da,wd,h,mi);last_sec=0xFF;}else item++; delay(30000);}
         if(se!=last_sec){last_sec=se;LED_TOGGLE();if(mi!=last_min){last_min=mi;OLED_ShowTime_Big(Dec_To_BCD(h),Dec_To_BCD(mi));}OLED_ShowChar_Big(4,6,se/10,2);OLED_ShowChar_Big(16,6,se%10,2);OLED_ShowProgress(se);if(da!=last_day){last_day=da;OLED_ShowDate(RTC_DR);}} delay(20000); }
 }
-
 
