@@ -126,15 +126,15 @@ void OLED_ShowProgress(uint8_t sec) {
     uint8_t filled = (uint8_t)(((uint16_t)sec * 80) / 60);
     for (uint8_t i = 0; i < 80; i++) row[i] = i < filled ? 0x3C : 0x24;
     OLED_WriteCmd(0xB7);
-    OLED_WriteCmd(0x10 | ((44 >> 4) & 0x0F));
-    OLED_WriteCmd(44 & 0x0F);
+    OLED_WriteCmd(0x10 | ((38 >> 4) & 0x0F));
+    OLED_WriteCmd(38 & 0x0F);
     OLED_WriteDataBuffer(row, 80);
 }
 void OLED_DrawHeaderRule(void) {
     OLED_WriteCmd(0xB1);
     OLED_WriteCmd(0x10);
     OLED_WriteCmd(0x02);
-    OLED_WriteDataFill(0x20, 124);
+    OLED_WriteDataFill(0x08, 124);
 }
 void OLED_ShowChar_Big(uint8_t x, uint8_t page_y, uint8_t char_idx, uint8_t scale) {
     if (scale == 0 || (8 % scale) != 0) return;
