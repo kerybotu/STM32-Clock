@@ -31,6 +31,7 @@
 #define SDA_H() (GPIOA_ODR |= (1<<10))
 #define SDA_L() (GPIOA_ODR &= ~(1<<10))
 #define SDA_READ() ((GPIOA_IDR & (1<<10)) ? 1 : 0)
+#define I2C_DELAY_COUNT 20
 
 void delay(volatile uint32_t count) { while(count--); }
 
@@ -43,17 +44,17 @@ const uint8_t Font6x8[15][6] = {
     {0x00,0x60,0x60,0x00,0x00}
 };
 
-void I2C_Start() { SDA_H(); SCL_H(); delay(100); SDA_L(); delay(100); SCL_L(); }
-void I2C_Stop()  { SCL_L(); SDA_L(); delay(100); SCL_H(); delay(100); SDA_H(); }
+void I2C_Start() { SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT); SDA_L(); delay(I2C_DELAY_COUNT); SCL_L(); }
+void I2C_Stop()  { SCL_L(); SDA_L(); delay(I2C_DELAY_COUNT); SCL_H(); delay(I2C_DELAY_COUNT); SDA_H(); }
 uint8_t I2C_WriteByte(uint8_t dat) {
     for(uint8_t i=0; i<8; i++) {
         if(dat & 0x80) SDA_H(); else SDA_L();
-        SCL_H(); delay(100); SCL_L(); delay(100);
+        SCL_H(); delay(I2C_DELAY_COUNT); SCL_L(); delay(I2C_DELAY_COUNT);
         dat <<= 1;
     }
-    SDA_H(); SCL_H(); delay(100);
+    SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT);
     uint8_t ack = SDA_READ();
-    SCL_L(); delay(100);
+    SCL_L(); delay(I2C_DELAY_COUNT);
     return ack;
 }
 void OLED_WriteCmd(uint8_t cmd) {
