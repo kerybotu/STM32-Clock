@@ -125,6 +125,7 @@ void OLED_ShowProgress(uint8_t sec) {
     uint8_t row[80];
     uint8_t filled = (uint8_t)(((uint16_t)sec * 80) / 60);
     for (uint8_t i = 0; i < 80; i++) row[i] = i < filled ? 0x3C : 0x24;
+    row[79] = 0x7E;                  // 右端封口
     OLED_WriteCmd(0xB7);
     OLED_WriteCmd(0x10 | ((34 >> 4) & 0x0F));
     OLED_WriteCmd(34 & 0x0F);
