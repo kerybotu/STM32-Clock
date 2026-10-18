@@ -126,8 +126,8 @@ void OLED_ShowProgress(uint8_t sec) {
     uint8_t filled = (uint8_t)(((uint16_t)sec * 80) / 60);
     for (uint8_t i = 0; i < 80; i++) row[i] = i < filled ? 0x3C : 0x24;
     OLED_WriteCmd(0xB7);
-    OLED_WriteCmd(0x10 | ((38 >> 4) & 0x0F));
-    OLED_WriteCmd(38 & 0x0F);
+    OLED_WriteCmd(0x10 | ((34 >> 4) & 0x0F));
+    OLED_WriteCmd(34 & 0x0F);
     OLED_WriteDataBuffer(row, 80);
 }
 void OLED_DrawHeaderRule(void) {
