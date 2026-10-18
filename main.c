@@ -235,7 +235,7 @@ uint8_t RTC_Init_LSE(void) {
     if (initialize_calendar) {
         // LSE 32768 / ((127 + 1) * (255 + 1)) = 1 Hz。
         RTC_PRER = (127 << 16) | 255;
-        RTC_TR = (0x12 << 16);      // 首次初始化为 12:00:00 (BCD)
+        RTC_TR = (0x16u << 16) | (0x20u << 8); // 首次初始化为 16:20:00 (BCD)
     }
     if (initialize_calendar || initialize_date) {
         RTC_DR = (0x26u << 16) | (7u << 13) | (0x10u << 8) | 0x18u;
