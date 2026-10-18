@@ -134,7 +134,7 @@ void OLED_DrawHeaderRule(void) {
     OLED_WriteCmd(0xB1);
     OLED_WriteCmd(0x10);
     OLED_WriteCmd(0x02);
-    OLED_WriteDataFill(0x80, 124);
+    OLED_WriteDataFill(0x20, 124);
 }
 void OLED_ShowChar_Big(uint8_t x, uint8_t page_y, uint8_t char_idx, uint8_t scale) {
     if (scale == 0 || (8 % scale) != 0) return;
