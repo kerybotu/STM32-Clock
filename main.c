@@ -24,6 +24,7 @@
 #define RTC_ISR      (*(volatile uint32_t *)0x4000280C)
 #define RTC_PRER     (*(volatile uint32_t *)0x40002810)
 #define RTC_WPR      (*(volatile uint32_t *)0x40002824)
+#define RTC_SSR      (*(volatile uint32_t *)0x40002828)
 
 #define LED_TOGGLE() (GPIOA_ODR ^= (1<<1))
 #define SCL_H() (GPIOA_ODR |= (1<<9))
@@ -41,13 +42,13 @@ static uint8_t ButtonDown(uint32_t mask) {
     return (GPIOA_IDR & mask) == 0;
 }
 
-const uint8_t Font6x8[15][6] = {
+const uint8_t Font6x8[16][6] = {
     {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
     {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
     {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
     {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
     {0x7F,0x40,0x40,0x40,0x40}, {0x3E,0x41,0x49,0x49,0x32}, {0x7F,0x49,0x49,0x49,0x41},
-    {0x00,0x60,0x60,0x00,0x00}
+    {0x00,0x60,0x60,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00}
 };
 
 void I2C_Start() { SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT); SDA_L(); delay(I2C_DELAY_COUNT); SCL_L(); }
@@ -258,19 +259,50 @@ static void RTC_WriteCalendar(uint8_t year, uint8_t month, uint8_t day, uint8_t 
     if (timeout) { RTC_TR=((uint32_t)Dec_To_BCD(hour)<<16)|((uint32_t)Dec_To_BCD(minute)<<8); RTC_DR=((uint32_t)Dec_To_BCD(year)<<16)|((uint32_t)(weekday&7u)<<13)|((uint32_t)Dec_To_BCD(month)<<8)|Dec_To_BCD(day); RTC_ISR&=~(1u<<7); timeout=0xFFFFFF; while((RTC_ISR&(1u<<6))&&--timeout){} RTC_ISR&=~(1u<<5); timeout=0xFFFFFF; while(!(RTC_ISR&(1u<<5))&&--timeout){} } RTC_WPR=0xFF;
 }
 static void RTC_ReadCalendar(uint8_t *year,uint8_t *month,uint8_t *day,uint8_t *weekday,uint8_t *hour,uint8_t *minute,uint8_t *second) { uint32_t a,b,d; do{a=RTC_TR;b=RTC_TR;}while(a!=b); d=RTC_DR; *year=BCD_To_Dec((uint8_t)(d>>16)); *month=BCD_To_Dec((uint8_t)((d>>8)&0x1F)); *day=BCD_To_Dec((uint8_t)(d&0x3F)); *weekday=(uint8_t)((d>>13)&7); *hour=BCD_To_Dec((uint8_t)(a>>16)); *minute=BCD_To_Dec((uint8_t)(a>>8)); *second=BCD_To_Dec((uint8_t)a); }
-/* With the default 16 MHz HSI, ~30k loop iterations are about 5–6 ms.
- * Saturating at 270 gives a long-press threshold close to 1.5 seconds. */
-static uint8_t ButtonEvent(uint32_t mask) {
-    uint16_t held_ticks = 0;
-    if (!ButtonDown(mask)) return 0;
-    delay(8000);                         // debounce press
-    if (!ButtonDown(mask)) return 0;
-    while (ButtonDown(mask)) {
-        delay(30000);
-        if (held_ticks < 270) held_ticks++;
+typedef struct {
+    uint8_t candidate, pressed, stable, long_sent;
+    uint16_t last_phase;
+    uint32_t held_ticks;
+} ButtonState;
+
+/* RTC runs at 256 subsecond ticks/s (PREDIV_S=255). */
+static uint16_t RTC_Phase(uint8_t second) {
+    return (uint16_t)(((uint16_t)second * 256u) + (255u - (RTC_SSR & 0xFFu)));
+}
+
+/* Non-blocking event: 1=short release, 2=long press at 1.5 s. */
+static uint8_t ButtonUpdate(ButtonState *b, uint32_t mask, uint16_t phase) {
+    uint8_t raw = ButtonDown(mask);
+    if (raw != b->candidate) { b->candidate = raw; b->stable = 0; return 0; }
+    if (b->stable < 4) { b->stable++; return 0; }
+    if (raw && !b->pressed) {
+        b->pressed = 1; b->long_sent = 0; b->held_ticks = 0; b->last_phase = phase;
+        return 0;
     }
-    delay(8000);                         // debounce release
-    return (held_ticks >= 270) ? 2 : 1;
+    if (!raw && b->pressed) {
+        b->pressed = 0;
+        if (!b->long_sent) return 1;
+        return 0;
+    }
+    if (raw && b->pressed) {
+        uint16_t elapsed = (uint16_t)((phase + 15360u - b->last_phase) % 15360u);
+        b->held_ticks += elapsed;
+        b->last_phase = phase;
+        if (!b->long_sent && b->held_ticks >= 384u) { b->long_sent = 1; return 2; }
+    }
+    return 0;
+}
+
+static void OLED_BlinkSettingField(uint8_t item, uint8_t visible,
+                                   uint8_t year, uint8_t month, uint8_t day,
+                                   uint8_t weekday, uint8_t hour, uint8_t minute) {
+    uint8_t a, c;
+    if (item == 0) { a = year / 10; c = year % 10; OLED_ShowChar(14,0,visible?a:15); OLED_ShowChar(20,0,visible?c:15); }
+    else if (item == 1) { a = month / 10; c = month % 10; OLED_ShowChar(32,0,visible?a:15); OLED_ShowChar(38,0,visible?c:15); }
+    else if (item == 2) { a = day / 10; c = day % 10; OLED_ShowChar(50,0,visible?a:15); OLED_ShowChar(56,0,visible?c:15); }
+    else if (item == 3) { OLED_ShowChar(96,0,15); OLED_ShowChar(102,0,visible?weekday:15); }
+    else if (item == 4) { a = hour / 10; c = hour % 10; OLED_ShowChar_Big(4,2,visible?a:15,4); OLED_ShowChar_Big(28,2,visible?c:15,4); }
+    else { a = minute / 10; c = minute % 10; OLED_ShowChar_Big(76,2,visible?a:15,4); OLED_ShowChar_Big(100,2,visible?c:15,4); }
 }
 static void OLED_Sleep(void){OLED_WriteCmd(0xAE);} static void OLED_Wake(void){OLED_WriteCmd(0xAF);}
 static uint8_t DateDays(uint8_t y,uint8_t m){static const uint8_t d[12]={31,28,31,30,31,30,31,31,30,31,30,31};uint8_t n=d[(m-1)%12];if(m==2&&(y%4)==0)n=29;return n;}
@@ -285,12 +317,54 @@ int main(void) {
     }
     OLED_DrawHeaderRule();
     uint8_t err=RTC_Init_LSE(); if(err){OLED_ShowChar(0,0,10);OLED_ShowChar(8,0,err);while(1){LED_TOGGLE();delay(500000);}}
-    uint8_t last_sec=0xFF,last_min=0xFF,last_day=0xFF,setting=0,asleep=0,item=0;
-    while(1){ if(asleep){if(ButtonEvent(BUTTON_WAKE_MASK)){asleep=0;OLED_Wake();OLED_DrawHeaderRule();last_sec=0xFF;last_min=0xFF;last_day=0xFF;}continue;}
-        uint8_t y,mo,da,wd,h,mi,se; RTC_ReadCalendar(&y,&mo,&da,&wd,&h,&mi,&se);
-        if(ButtonEvent(BUTTON_WAKE_MASK)){OLED_Sleep();asleep=1;continue;} uint8_t ev=ButtonEvent(BUTTON_SET_MASK);
-        if(!setting&&ev==2){setting=1;item=0;RTC_WriteCalendar(y,mo,da,wd,h,mi);last_sec=0xFF;}
-        else if(setting&&ev){if(ev==1){if(item==0)y=(y>=99)?0:y+1;else if(item==1)mo=(mo>=12)?1:mo+1;else if(item==2){uint8_t mx=DateDays(y,mo);da=(da>=mx)?1:da+1;}else if(item==3)wd=(wd>=7)?1:wd+1;else if(item==4)h=(h>=23)?0:h+1;else mi=(mi>=59)?0:mi+1;RTC_WriteCalendar(y,mo,da,wd,h,mi);}else if(item>=5){setting=0;item=0;RTC_WriteCalendar(y,mo,da,wd,h,mi);last_sec=0xFF;}else item++; delay(30000);}
-        if(se!=last_sec){last_sec=se;LED_TOGGLE();if(mi!=last_min){last_min=mi;OLED_ShowTime_Big(Dec_To_BCD(h),Dec_To_BCD(mi));}OLED_ShowChar_Big(4,6,se/10,2);OLED_ShowChar_Big(16,6,se%10,2);OLED_ShowProgress(se);if(da!=last_day){last_day=da;OLED_ShowDate(RTC_DR);}} delay(20000); }
+    uint8_t last_sec=0xFF,last_min=0xFF,last_day=0xFF,setting=0,asleep=0,item=0,last_blink=0xFF;
+    ButtonState wake_button, set_button;
+    wake_button.candidate=0; wake_button.pressed=0; wake_button.stable=0; wake_button.long_sent=0; wake_button.last_phase=0; wake_button.held_ticks=0;
+    set_button.candidate=0; set_button.pressed=0; set_button.stable=0; set_button.long_sent=0; set_button.last_phase=0; set_button.held_ticks=0;
+    while(1) {
+        uint8_t y,mo,da,wd,h,mi,se;
+        RTC_ReadCalendar(&y,&mo,&da,&wd,&h,&mi,&se);
+        uint16_t phase=RTC_Phase(se);
+        uint8_t wake_evt=ButtonUpdate(&wake_button,BUTTON_WAKE_MASK,phase);
+        uint8_t set_evt=ButtonUpdate(&set_button,BUTTON_SET_MASK,phase);
+
+        if (asleep) {
+            if (wake_evt==1) { asleep=0; OLED_Wake(); OLED_DrawHeaderRule(); last_sec=0xFF; last_min=0xFF; last_day=0xFF; }
+            delay(20000);
+            continue;
+        }
+        if (wake_evt==1) { OLED_Sleep(); asleep=1; delay(20000); continue; }
+
+        if (!setting && set_evt==2) {
+            setting=1; item=0; RTC_WriteCalendar(y,mo,da,wd,h,mi);
+            last_sec=0xFF; last_min=0xFF; last_day=0xFF; last_blink=0xFF;
+        } else if (setting && set_evt) {
+            if (set_evt==1) {
+                if(item==0)y=(y>=99)?0:y+1;
+                else if(item==1)mo=(mo>=12)?1:mo+1;
+                else if(item==2){uint8_t mx=DateDays(y,mo);da=(da>=mx)?1:da+1;}
+                else if(item==3)wd=(wd>=7)?1:wd+1;
+                else if(item==4)h=(h>=23)?0:h+1;
+                else mi=(mi>=59)?0:mi+1;
+                RTC_WriteCalendar(y,mo,da,wd,h,mi);
+                last_sec=0xFF; last_min=0xFF; last_day=0xFF;
+            } else if(item>=5) {
+                setting=0; item=0; RTC_WriteCalendar(y,mo,da,wd,h,mi);
+                last_sec=0xFF; last_min=0xFF; last_day=0xFF;
+            } else { item++; last_blink=0xFF; }
+        }
+
+        if(se!=last_sec) {
+            last_sec=se; LED_TOGGLE();
+            if(mi!=last_min){last_min=mi;OLED_ShowTime_Big(Dec_To_BCD(h),Dec_To_BCD(mi));}
+            OLED_ShowChar_Big(4,6,se/10,2); OLED_ShowChar_Big(16,6,se%10,2); OLED_ShowProgress(se);
+            if(da!=last_day){last_day=da;OLED_ShowDate(RTC_DR);}
+        }
+        if(setting) {
+            uint8_t blink=(uint8_t)((phase/128u)&1u);
+            if(blink!=last_blink){last_blink=blink;OLED_BlinkSettingField(item,blink,y,mo,da,wd,h,mi);}
+        }
+        delay(20000);
+    }
 }
 
