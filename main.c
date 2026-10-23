@@ -31,7 +31,7 @@
 #define SDA_H() (GPIOA_ODR |= (1<<10))
 #define SDA_L() (GPIOA_ODR &= ~(1<<10))
 #define SDA_READ() ((GPIOA_IDR & (1<<10)) ? 1 : 0)
-#define I2C_DELAY_COUNT 20
+#define I2C_DELAY_COUNT 1
 #define BUTTON_WAKE_MASK (1u << 0)
 #define BUTTON_SET_MASK  (1u << 4)
 
@@ -66,6 +66,11 @@ uint8_t I2C_WriteByte(uint8_t dat) {
 void OLED_WriteCmd(uint8_t cmd) {
     I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x00); I2C_WriteByte(cmd); I2C_Stop();
 }
+static void OLED_WriteCmds(const uint8_t *cmds, uint8_t count) {
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x00);
+    while (count--) I2C_WriteByte(*cmds++);
+    I2C_Stop();
+}
 void OLED_WriteData(uint8_t data) {
     I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40); I2C_WriteByte(data); I2C_Stop();
 }
@@ -80,20 +85,15 @@ void OLED_WriteDataFill(uint8_t value, uint8_t length) {
     I2C_Stop();
 }
 void OLED_Init() {
-    OLED_WriteCmd(0xAE); OLED_WriteCmd(0x20); OLED_WriteCmd(0x00);
-    OLED_WriteCmd(0xB0); OLED_WriteCmd(0xC8); OLED_WriteCmd(0x00); OLED_WriteCmd(0x10);
-    OLED_WriteCmd(0x40); OLED_WriteCmd(0x81); OLED_WriteCmd(0xCF);
-    OLED_WriteCmd(0xA1); OLED_WriteCmd(0xA6); OLED_WriteCmd(0xA8); OLED_WriteCmd(0x3F);
-    OLED_WriteCmd(0xA4); OLED_WriteCmd(0xD3); OLED_WriteCmd(0x00); OLED_WriteCmd(0xD5);
-    OLED_WriteCmd(0x80); OLED_WriteCmd(0xD9); OLED_WriteCmd(0xF1); OLED_WriteCmd(0xDA);
-    OLED_WriteCmd(0x12); OLED_WriteCmd(0xDB); OLED_WriteCmd(0x40); OLED_WriteCmd(0x8D);
-    OLED_WriteCmd(0x14); OLED_WriteCmd(0xAF);
+    static const uint8_t init_cmds[] = {0xAE,0x20,0x00,0xB0,0xC8,0x00,0x10,0x40,0x81,0xCF,0xA1,0xA6,0xA8,0x3F,0xA4,0xD3,0x00,0xD5,0x80,0xD9,0xF1,0xDA,0x12,0xDB,0x40,0x8D,0x14,0xAF};
+    OLED_WriteCmds(init_cmds, sizeof(init_cmds));
 }
 void OLED_ShowChar(uint8_t x, uint8_t page_y, uint8_t char_idx) {
-    OLED_WriteCmd(0xB0 + page_y);
-    OLED_WriteCmd(((x & 0xF0) >> 4) | 0x10);
-    OLED_WriteCmd(x & 0x0F);
-    for(uint8_t i=0; i<6; i++) OLED_WriteData(Font6x8[char_idx][i]);
+    uint8_t cmds[] = {(uint8_t)(0xB0 + page_y), (uint8_t)(((x & 0xF0) >> 4) | 0x10), (uint8_t)(x & 0x0F)};
+    OLED_WriteCmds(cmds, sizeof(cmds));
+    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
+    for(uint8_t i=0; i<6; i++) I2C_WriteByte(Font6x8[char_idx][i]);
+    I2C_Stop();
 }
 void OLED_ShowText(uint8_t x, uint8_t page_y, const uint8_t *text) {
     while (*text) {
@@ -133,25 +133,20 @@ void OLED_ShowProgress(uint8_t sec) {
     uint8_t filled = (uint8_t)(((uint16_t)sec * 80) / 60);
     for (uint8_t i = 0; i < 80; i++) row[i] = i < filled ? 0x3C : 0x24;
     row[79] = 0x7E;                  // 右端封口
-    OLED_WriteCmd(0xB7);
-    OLED_WriteCmd(0x10 | ((34 >> 4) & 0x0F));
-    OLED_WriteCmd(34 & 0x0F);
-    OLED_WriteDataBuffer(row, 80);
+    uint8_t cmds[] = {0xB7, (uint8_t)(0x10 | ((34 >> 4) & 0x0F)), (uint8_t)(34 & 0x0F)};
+    OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataBuffer(row, 80);
 }
 void OLED_DrawHeaderRule(void) {
-    OLED_WriteCmd(0xB1);
-    OLED_WriteCmd(0x10);
-    OLED_WriteCmd(0x02);
-    OLED_WriteDataFill(0x08, 124);
+    static const uint8_t cmds[] = {0xB1,0x10,0x02};
+    OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataFill(0x08, 124);
 }
 void OLED_ShowChar_Big(uint8_t x, uint8_t page_y, uint8_t char_idx, uint8_t scale) {
     if (scale == 0 || (8 % scale) != 0) return;
     uint8_t bpp = 8 / scale;
     for (uint8_t page = 0; page < scale; page++) {
         uint8_t sb = page * bpp;
-        OLED_WriteCmd(0xB0 + page_y + page);
-        OLED_WriteCmd(((x & 0xF0) >> 4) | 0x10);
-        OLED_WriteCmd(x & 0x0F);
+        uint8_t cmds[] = {(uint8_t)(0xB0 + page_y + page), (uint8_t)(((x & 0xF0) >> 4) | 0x10), (uint8_t)(x & 0x0F)};
+        OLED_WriteCmds(cmds, sizeof(cmds)); I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
         for (uint8_t col = 0; col < 6; col++) {
             uint8_t cd = Font6x8[char_idx][col];
             uint8_t ob = 0;
@@ -160,8 +155,9 @@ void OLED_ShowChar_Big(uint8_t x, uint8_t page_y, uint8_t char_idx, uint8_t scal
                     for (uint8_t s = 0; s < scale; s++) ob |= (1 << (b * scale + s));
                 }
             }
-            for (uint8_t s = 0; s < scale; s++) OLED_WriteData(ob);
+            for (uint8_t s = 0; s < scale; s++) I2C_WriteByte(ob);
         }
+        I2C_Stop();
     }
 }
 void OLED_ShowTime_Big(uint8_t h, uint8_t m) {
@@ -268,7 +264,13 @@ static uint8_t DateDays(uint8_t y,uint8_t m){static const uint8_t d[12]={31,28,3
 
 int main(void) {
     RCC_IOPENR|=(1<<0); GPIOA_MODER&=~((3u<<0)|(3u<<2)|(3u<<8)); GPIOA_MODER|=(1u<<2); GPIOA_MODER&=~((3u<<18)|(3u<<20)); GPIOA_MODER|=((1u<<18)|(1u<<20)); GPIOA_OTYPER|=(1<<9)|(1<<10); GPIOA_PUPDR&=~((3u<<0)|(3u<<8)|(3u<<18)|(3u<<20)); GPIOA_PUPDR|=(1u<<0)|(1u<<8)|(1u<<18)|(1u<<20);
-    for(volatile int i=0;i<2000000;i++); OLED_Init(); for(uint8_t i=0;i<8;i++){OLED_WriteCmd(0xB0+i);OLED_WriteCmd(0);OLED_WriteCmd(0x10);OLED_WriteDataFill(0,128);} OLED_DrawHeaderRule();
+    for(volatile int i=0;i<2000000;i++);
+    OLED_Init();
+    for(uint8_t i=0;i<8;i++){
+        uint8_t cmds[] = {(uint8_t)(0xB0+i),0x00,0x10};
+        OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataFill(0,128);
+    }
+    OLED_DrawHeaderRule();
     uint8_t err=RTC_Init_LSE(); if(err){OLED_ShowChar(0,0,10);OLED_ShowChar(8,0,err);while(1){LED_TOGGLE();delay(500000);}}
     uint8_t last_sec=0xFF,last_min=0xFF,last_day=0xFF,setting=0,asleep=0,item=0;
     while(1){ if(asleep){if(ButtonEvent(BUTTON_WAKE_MASK)){asleep=0;OLED_Wake();OLED_DrawHeaderRule();last_sec=0xFF;last_min=0xFF;last_day=0xFF;}continue;}
