@@ -258,7 +258,20 @@ static void RTC_WriteCalendar(uint8_t year, uint8_t month, uint8_t day, uint8_t 
     if (timeout) { RTC_TR=((uint32_t)Dec_To_BCD(hour)<<16)|((uint32_t)Dec_To_BCD(minute)<<8); RTC_DR=((uint32_t)Dec_To_BCD(year)<<16)|((uint32_t)(weekday&7u)<<13)|((uint32_t)Dec_To_BCD(month)<<8)|Dec_To_BCD(day); RTC_ISR&=~(1u<<7); timeout=0xFFFFFF; while((RTC_ISR&(1u<<6))&&--timeout){} RTC_ISR&=~(1u<<5); timeout=0xFFFFFF; while(!(RTC_ISR&(1u<<5))&&--timeout){} } RTC_WPR=0xFF;
 }
 static void RTC_ReadCalendar(uint8_t *year,uint8_t *month,uint8_t *day,uint8_t *weekday,uint8_t *hour,uint8_t *minute,uint8_t *second) { uint32_t a,b,d; do{a=RTC_TR;b=RTC_TR;}while(a!=b); d=RTC_DR; *year=BCD_To_Dec((uint8_t)(d>>16)); *month=BCD_To_Dec((uint8_t)((d>>8)&0x1F)); *day=BCD_To_Dec((uint8_t)(d&0x3F)); *weekday=(uint8_t)((d>>13)&7); *hour=BCD_To_Dec((uint8_t)(a>>16)); *minute=BCD_To_Dec((uint8_t)(a>>8)); *second=BCD_To_Dec((uint8_t)a); }
-static uint8_t ButtonEvent(uint32_t mask) { uint16_t ticks=0; if(!ButtonDown(mask))return 0; delay(8000); if(!ButtonDown(mask))return 0; while(ButtonDown(mask)){delay(10000);if(ticks<250)ticks++;} delay(8000); return ticks>=120?2:1; }
+/* With the default 16 MHz HSI, ~30k loop iterations are about 5–6 ms.
+ * Saturating at 270 gives a long-press threshold close to 1.5 seconds. */
+static uint8_t ButtonEvent(uint32_t mask) {
+    uint16_t held_ticks = 0;
+    if (!ButtonDown(mask)) return 0;
+    delay(8000);                         // debounce press
+    if (!ButtonDown(mask)) return 0;
+    while (ButtonDown(mask)) {
+        delay(30000);
+        if (held_ticks < 270) held_ticks++;
+    }
+    delay(8000);                         // debounce release
+    return (held_ticks >= 270) ? 2 : 1;
+}
 static void OLED_Sleep(void){OLED_WriteCmd(0xAE);} static void OLED_Wake(void){OLED_WriteCmd(0xAF);}
 static uint8_t DateDays(uint8_t y,uint8_t m){static const uint8_t d[12]={31,28,31,30,31,30,31,31,30,31,30,31};uint8_t n=d[(m-1)%12];if(m==2&&(y%4)==0)n=29;return n;}
 
