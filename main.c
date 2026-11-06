@@ -1,9 +1,13 @@
 #include <stdint.h>
+#include "button_state.h"
+#include "display_logic.h"
 
 // --- 寄存器 ---
 #define RCC_IOPENR   (*(volatile uint32_t *)0x4002102C)
 #define RCC_APB1ENR  (*(volatile uint32_t *)0x40021038)
 #define RCC_CSR      (*(volatile uint32_t *)0x40021050)
+#define RCC_CR       (*(volatile uint32_t *)0x40021000)
+#define RCC_CFGR     (*(volatile uint32_t *)0x4002100C)
 #define RCC_CSR_RTCRST (1u << 19)
 #define RCC_CSR_RTCEN  (1u << 18)
 #define RCC_CSR_RTCSEL (3u << 16)
@@ -25,6 +29,9 @@
 #define RTC_PRER     (*(volatile uint32_t *)0x40002810)
 #define RTC_WPR      (*(volatile uint32_t *)0x40002824)
 #define RTC_SSR      (*(volatile uint32_t *)0x40002828)
+#define SYST_CSR     (*(volatile uint32_t *)0xE000E010)
+#define SYST_RVR     (*(volatile uint32_t *)0xE000E014)
+#define SYST_CVR     (*(volatile uint32_t *)0xE000E018)
 
 #define LED_TOGGLE() (GPIOA_ODR ^= (1<<1))
 #define SCL_H() (GPIOA_ODR |= (1<<9))
@@ -32,9 +39,28 @@
 #define SDA_H() (GPIOA_ODR |= (1<<10))
 #define SDA_L() (GPIOA_ODR &= ~(1<<10))
 #define SDA_READ() ((GPIOA_IDR & (1<<10)) ? 1 : 0)
-#define I2C_DELAY_COUNT 1
+#define I2C_DELAY_COUNT 4
 #define BUTTON_WAKE_MASK (1u << 0)
 #define BUTTON_SET_MASK  (1u << 4)
+
+volatile uint32_t g_ms;
+volatile uint32_t rtc_debug_rcc_csr, rtc_debug_prer, rtc_debug_ssr;
+
+void SysTick_Handler(void) { g_ms++; }
+
+static void Clock_Init_16MHz(void) {
+    RCC_CR |= (1u << 8);                         // HSI16 ON (STM32L0 RCC_CR)
+    while (!(RCC_CR & (1u << 10))) {}            // wait HSIRDY
+    RCC_CFGR = (RCC_CFGR & ~3u) | 1u;            // SYSCLK = HSI16
+    while ((RCC_CFGR & (3u << 2)) != (1u << 2)) {}
+}
+
+static void SysTick_Init_1ms(void) {
+    SYST_CSR = 0;
+    SYST_RVR = 16000u - 1u;
+    SYST_CVR = 0;
+    SYST_CSR = 7u;                               // processor clock, interrupt, enable
+}
 
 void delay(volatile uint32_t count) { while(count--); }
 
@@ -51,6 +77,27 @@ const uint8_t Font6x8[16][6] = {
     {0x00,0x60,0x60,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00}
 };
 
+typedef struct { uint8_t x, page, glyph, scale, offset; } DisplayJob;
+static DisplayJob display_jobs[64];
+static uint8_t display_head, display_tail;
+volatile uint8_t oled_i2c_error;
+static uint8_t progress_target, progress_current, progress_scan, progress_initial, progress_started;
+static uint8_t drawn_time[4]={0xFF,0xFF,0xFF,0xFF};
+static uint8_t drawn_seconds[2]={0xFF,0xFF};
+static uint8_t colon_drawn;
+
+static void OLED_QueueGlyph(uint8_t x, uint8_t page, uint8_t glyph, uint8_t scale) {
+    if (!scale || (8u % scale)) return;
+    for (uint8_t p=0; p<scale; p++) {
+        uint8_t next=(uint8_t)((display_head+1u)&63u);
+        if (next==display_tail) { oled_i2c_error=1; return; }
+        display_jobs[display_head]=(DisplayJob){x,(uint8_t)(page+p),glyph,scale,p};
+        display_head=next;
+    }
+}
+
+static void OLED_ClearQueue(void) { display_head=0; display_tail=0; }
+
 void I2C_Start() { SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT); SDA_L(); delay(I2C_DELAY_COUNT); SCL_L(); }
 void I2C_Stop()  { SCL_L(); SDA_L(); delay(I2C_DELAY_COUNT); SCL_H(); delay(I2C_DELAY_COUNT); SDA_H(); }
 uint8_t I2C_WriteByte(uint8_t dat) {
@@ -64,37 +111,56 @@ uint8_t I2C_WriteByte(uint8_t dat) {
     SCL_L(); delay(I2C_DELAY_COUNT);
     return ack;
 }
+static uint8_t OLED_Tx(uint8_t value) {
+    if (I2C_WriteByte(value)) { oled_i2c_error=1; return 0; }
+    return 1;
+}
 void OLED_WriteCmd(uint8_t cmd) {
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x00); I2C_WriteByte(cmd); I2C_Stop();
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x00) || !OLED_Tx(cmd)) oled_i2c_error=1;
+    I2C_Stop();
 }
 static void OLED_WriteCmds(const uint8_t *cmds, uint8_t count) {
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x00);
-    while (count--) I2C_WriteByte(*cmds++);
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x00)) { I2C_Stop(); return; }
+    while (count--) if (!OLED_Tx(*cmds++)) break;
     I2C_Stop();
 }
 void OLED_WriteData(uint8_t data) {
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40); I2C_WriteByte(data); I2C_Stop();
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x40) || !OLED_Tx(data)) oled_i2c_error=1;
+    I2C_Stop();
 }
 void OLED_WriteDataBuffer(const uint8_t *data, uint8_t length) {
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
-    while (length--) I2C_WriteByte(*data++);
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x40)) { I2C_Stop(); return; }
+    while (length--) if (!OLED_Tx(*data++)) break;
     I2C_Stop();
 }
 void OLED_WriteDataFill(uint8_t value, uint8_t length) {
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
-    while (length--) I2C_WriteByte(value);
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x40)) { I2C_Stop(); return; }
+    while (length--) if (!OLED_Tx(value)) break;
     I2C_Stop();
+}
+static uint8_t OLED_WriteAt(uint8_t page, uint8_t x, const uint8_t *data, uint8_t length) {
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x00) || !OLED_Tx((uint8_t)(0xB0+page)) ||
+        !OLED_Tx((uint8_t)(((x>>4)&0x0F)|0x10)) || !OLED_Tx((uint8_t)(x&0x0F))) {
+        I2C_Stop(); return 0;
+    }
+    I2C_Start();
+    if (!OLED_Tx(0x78) || !OLED_Tx(0x40)) { I2C_Stop(); return 0; }
+    while (length--) if (!OLED_Tx(*data++)) { I2C_Stop(); return 0; }
+    I2C_Stop();
+    return 1;
 }
 void OLED_Init() {
     static const uint8_t init_cmds[] = {0xAE,0x20,0x00,0xB0,0xC8,0x00,0x10,0x40,0x81,0xCF,0xA1,0xA6,0xA8,0x3F,0xA4,0xD3,0x00,0xD5,0x80,0xD9,0xF1,0xDA,0x12,0xDB,0x40,0x8D,0x14,0xAF};
     OLED_WriteCmds(init_cmds, sizeof(init_cmds));
 }
 void OLED_ShowChar(uint8_t x, uint8_t page_y, uint8_t char_idx) {
-    uint8_t cmds[] = {(uint8_t)(0xB0 + page_y), (uint8_t)(((x & 0xF0) >> 4) | 0x10), (uint8_t)(x & 0x0F)};
-    OLED_WriteCmds(cmds, sizeof(cmds));
-    I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
-    for(uint8_t i=0; i<6; i++) I2C_WriteByte(Font6x8[char_idx][i]);
-    I2C_Stop();
+    OLED_QueueGlyph(x,page_y,char_idx,1);
 }
 void OLED_ShowText(uint8_t x, uint8_t page_y, const uint8_t *text) {
     while (*text) {
@@ -130,44 +196,74 @@ void OLED_ShowDate(uint32_t dr) {
     OLED_ShowText(96, 0, (const uint8_t *)"LSE");
 }
 void OLED_ShowProgress(uint8_t sec) {
-    uint8_t row[80];
-    uint8_t filled = (uint8_t)(((uint16_t)sec * 80) / 60);
-    for (uint8_t i = 0; i < 80; i++) row[i] = i < filled ? 0x3C : 0x24;
-    row[79] = 0x7E;                  // 右端封口
-    uint8_t cmds[] = {0xB7, (uint8_t)(0x10 | ((34 >> 4) & 0x0F)), (uint8_t)(34 & 0x0F)};
-    OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataBuffer(row, 80);
+    progress_target=ProgressTarget(sec);
+    if (!progress_started) { progress_started=1; progress_initial=1; progress_scan=0; }
 }
 void OLED_DrawHeaderRule(void) {
     static const uint8_t cmds[] = {0xB1,0x10,0x02};
     OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataFill(0x08, 124);
 }
 void OLED_ShowChar_Big(uint8_t x, uint8_t page_y, uint8_t char_idx, uint8_t scale) {
-    if (scale == 0 || (8 % scale) != 0) return;
-    uint8_t bpp = 8 / scale;
-    for (uint8_t page = 0; page < scale; page++) {
-        uint8_t sb = page * bpp;
-        uint8_t cmds[] = {(uint8_t)(0xB0 + page_y + page), (uint8_t)(((x & 0xF0) >> 4) | 0x10), (uint8_t)(x & 0x0F)};
-        OLED_WriteCmds(cmds, sizeof(cmds)); I2C_Start(); I2C_WriteByte(0x78); I2C_WriteByte(0x40);
-        for (uint8_t col = 0; col < 6; col++) {
-            uint8_t cd = Font6x8[char_idx][col];
-            uint8_t ob = 0;
-            for (uint8_t b = 0; b < bpp; b++) {
-                if (cd & (1 << (sb + b))) {
-                    for (uint8_t s = 0; s < scale; s++) ob |= (1 << (b * scale + s));
-                }
-            }
-            for (uint8_t s = 0; s < scale; s++) I2C_WriteByte(ob);
-        }
-        I2C_Stop();
-    }
+    OLED_QueueGlyph(x,page_y,char_idx,scale);
 }
 void OLED_ShowTime_Big(uint8_t h, uint8_t m) {
-    uint8_t sc = 4;
-    OLED_ShowChar_Big(  4, 2, (h >> 4) & 0x0F, sc);
-    OLED_ShowChar_Big( 28, 2,  h       & 0x0F, sc);
-    OLED_ShowChar_Big( 52, 2, 10,              sc);
-    OLED_ShowChar_Big( 76, 2, (m >> 4) & 0x0F, sc);
-    OLED_ShowChar_Big(100, 2,  m       & 0x0F, sc);
+    uint8_t digits[4]={(uint8_t)((h>>4)&0x0F),(uint8_t)(h&0x0F),
+                       (uint8_t)((m>>4)&0x0F),(uint8_t)(m&0x0F)};
+    static const uint8_t x[4]={4,28,76,100};
+    for(uint8_t i=0;i<4;i++) if(drawn_time[i]!=digits[i]) {
+        drawn_time[i]=digits[i]; OLED_ShowChar_Big(x[i],2,digits[i],4);
+    }
+    if(!colon_drawn){colon_drawn=1;OLED_ShowChar_Big(52,2,10,4);}
+}
+
+static void OLED_ShowSeconds(uint8_t second) {
+    uint8_t digits[2]={(uint8_t)(second/10u),(uint8_t)(second%10u)};
+    static const uint8_t x[2]={4,16};
+    for(uint8_t i=0;i<2;i++) if(drawn_seconds[i]!=digits[i]) {
+        drawn_seconds[i]=digits[i]; OLED_ShowChar_Big(x[i],6,digits[i],2);
+    }
+}
+
+static void OLED_ResetRendered(void) {
+    for(uint8_t i=0;i<4;i++) drawn_time[i]=0xFF;
+    drawn_seconds[0]=drawn_seconds[1]=0xFF;
+    colon_drawn=0;
+}
+
+static uint8_t OLED_DisplayTask(void) {
+    if(display_tail!=display_head) {
+        DisplayJob job=display_jobs[display_tail];
+        uint8_t data[24],count=0,bpp=(uint8_t)(8u/job.scale),sb=(uint8_t)(job.offset*bpp);
+        for(uint8_t col=0;col<6;col++) {
+            uint8_t bits=Font6x8[job.glyph][col],out=0;
+            for(uint8_t b=0;b<bpp;b++) if(bits&(1u<<(sb+b)))
+                for(uint8_t s=0;s<job.scale;s++) out|=(uint8_t)(1u<<(b*job.scale+s));
+            for(uint8_t s=0;s<job.scale;s++) data[count++]=out;
+        }
+        (void)OLED_WriteAt(job.page,job.x,data,count);
+        display_tail=(uint8_t)((display_tail+1u)&63u);
+        return 1;
+    }
+    uint8_t start,length;
+    if(progress_initial) {
+        start=progress_scan; length=(uint8_t)((80u-start>8u)?8u:80u-start);
+    } else if(progress_current<progress_target) {
+        uint8_t delta=(uint8_t)(progress_target-progress_current);
+        start=progress_current; length=(delta>8u)?8u:delta;
+    } else if(progress_current>progress_target) {
+        uint8_t delta=(uint8_t)(progress_current-progress_target);
+        length=(delta>8u)?8u:delta;
+        start=(uint8_t)(progress_current-length);
+    } else return 0;
+    uint8_t bytes[8];
+    for(uint8_t i=0;i<length;i++) bytes[i]=ProgressByte((uint8_t)(start+i),progress_target);
+    (void)OLED_WriteAt(7,(uint8_t)(34u+start),bytes,length);
+    if(progress_initial) {
+        progress_scan=(uint8_t)(progress_scan+length);
+        if(progress_scan>=80) { progress_initial=0; progress_scan=0; progress_current=progress_target; }
+    } else if(progress_current<progress_target) progress_current=(uint8_t)(progress_current+length);
+    else progress_current=(uint8_t)(progress_current-length);
+    return 1;
 }
 
 /* --- RTC 初始化：使用外部 LSE --- */
@@ -190,10 +286,18 @@ uint8_t RTC_Init_LSE(void) {
         initialize_calendar = 1;
     }
 
-    // LSE 使用外部 32.768 kHz 晶体；驱动等级只在振荡器关闭时设置。
+    // 试用中高驱动档；驱动档仅能在 LSE 关闭时修改。
+    if ((RCC_CSR & RCC_CSR_LSEON) &&
+        (RCC_CSR & RCC_CSR_LSEDRV) != (2u << 11)) {
+        RCC_CSR &= ~RCC_CSR_LSEON;
+        timeout = 0xFFFFFF;
+        while ((RCC_CSR & RCC_CSR_LSERDY) && --timeout) {}
+        if (!timeout) return 6;
+    }
     if (!(RCC_CSR & RCC_CSR_LSEON)) {
         RCC_CSR &= ~RCC_CSR_LSEBYP;
         RCC_CSR &= ~RCC_CSR_LSEDRV;
+        RCC_CSR |= (2u << 11);
         RCC_CSR |= RCC_CSR_LSEON;
     }
 
@@ -258,39 +362,24 @@ static void RTC_WriteCalendar(uint8_t year, uint8_t month, uint8_t day, uint8_t 
     while (!(RTC_ISR&(1u<<6)) && --timeout) {}
     if (timeout) { RTC_TR=((uint32_t)Dec_To_BCD(hour)<<16)|((uint32_t)Dec_To_BCD(minute)<<8)|Dec_To_BCD(second); RTC_DR=((uint32_t)Dec_To_BCD(year)<<16)|((uint32_t)(weekday&7u)<<13)|((uint32_t)Dec_To_BCD(month)<<8)|Dec_To_BCD(day); RTC_ISR&=~(1u<<7); timeout=0xFFFFFF; while((RTC_ISR&(1u<<6))&&--timeout){} RTC_ISR&=~(1u<<5); timeout=0xFFFFFF; while(!(RTC_ISR&(1u<<5))&&--timeout){} } RTC_WPR=0xFF;
 }
-static void RTC_ReadCalendar(uint8_t *year,uint8_t *month,uint8_t *day,uint8_t *weekday,uint8_t *hour,uint8_t *minute,uint8_t *second) { uint32_t a,b,d; do{a=RTC_TR;b=RTC_TR;}while(a!=b); d=RTC_DR; *year=BCD_To_Dec((uint8_t)(d>>16)); *month=BCD_To_Dec((uint8_t)((d>>8)&0x1F)); *day=BCD_To_Dec((uint8_t)(d&0x3F)); *weekday=(uint8_t)((d>>13)&7); *hour=BCD_To_Dec((uint8_t)(a>>16)); *minute=BCD_To_Dec((uint8_t)(a>>8)); *second=BCD_To_Dec((uint8_t)a); }
-typedef struct {
-    uint8_t candidate, pressed, stable, long_sent;
-    uint16_t last_phase;
-    uint32_t held_ticks;
-} ButtonState;
-
-/* RTC runs at 256 subsecond ticks/s (PREDIV_S=255). */
-static uint16_t RTC_Phase(uint8_t second) {
-    return (uint16_t)(((uint16_t)second * 256u) + (255u - (RTC_SSR & 0xFFu)));
+static void RTC_ReadSnapshot(uint32_t *tr, uint32_t *dr, uint32_t *ssr) {
+    uint32_t first, last;
+    do {
+        first = RTC_TR;
+        *dr = RTC_DR;
+        *ssr = RTC_SSR;
+        last = RTC_TR;
+    } while (first != last);
+    *tr = first;
 }
 
-/* Non-blocking event: 1=short release, 2=long press at 1.5 s. */
-static uint8_t ButtonUpdate(ButtonState *b, uint32_t mask, uint16_t phase) {
-    uint8_t raw = ButtonDown(mask);
-    if (raw != b->candidate) { b->candidate = raw; b->stable = 0; return 0; }
-    if (b->stable < 4) { b->stable++; return 0; }
-    if (raw && !b->pressed) {
-        b->pressed = 1; b->long_sent = 0; b->held_ticks = 0; b->last_phase = phase;
-        return 0;
-    }
-    if (!raw && b->pressed) {
-        b->pressed = 0;
-        if (!b->long_sent) return 1;
-        return 0;
-    }
-    if (raw && b->pressed) {
-        uint16_t elapsed = (uint16_t)((phase + 15360u - b->last_phase) % 15360u);
-        b->held_ticks += elapsed;
-        b->last_phase = phase;
-        if (!b->long_sent && b->held_ticks >= 384u) { b->long_sent = 1; return 2; }
-    }
-    return 0;
+static void RTC_DecodeSnapshot(uint32_t tr, uint32_t dr,
+                               uint8_t *year,uint8_t *month,uint8_t *day,uint8_t *weekday,
+                               uint8_t *hour,uint8_t *minute,uint8_t *second) {
+    *year=BCD_To_Dec((uint8_t)(dr>>16)); *month=BCD_To_Dec((uint8_t)((dr>>8)&0x1F));
+    *day=BCD_To_Dec((uint8_t)(dr&0x3F)); *weekday=(uint8_t)((dr>>13)&7);
+    *hour=BCD_To_Dec((uint8_t)(tr>>16)); *minute=BCD_To_Dec((uint8_t)(tr>>8));
+    *second=BCD_To_Dec((uint8_t)tr);
 }
 
 static void OLED_BlinkSettingField(uint8_t item, uint8_t visible,
@@ -309,6 +398,8 @@ static void OLED_Sleep(void){OLED_WriteCmd(0xAE);} static void OLED_Wake(void){O
 static uint8_t DateDays(uint8_t y,uint8_t m){static const uint8_t d[12]={31,28,31,30,31,30,31,31,30,31,30,31};uint8_t n=d[(m-1)%12];if(m==2&&(y%4)==0)n=29;return n;}
 
 int main(void) {
+    Clock_Init_16MHz();
+    SysTick_Init_1ms();
     RCC_IOPENR|=(1<<0); GPIOA_MODER&=~((3u<<0)|(3u<<2)|(3u<<8)); GPIOA_MODER|=(1u<<2); GPIOA_MODER&=~((3u<<18)|(3u<<20)); GPIOA_MODER|=((1u<<18)|(1u<<20)); GPIOA_OTYPER|=(1<<9)|(1<<10); GPIOA_PUPDR&=~((3u<<0)|(3u<<8)|(3u<<18)|(3u<<20)); GPIOA_PUPDR|=(1u<<0)|(1u<<8)|(1u<<18)|(1u<<20);
     for(volatile int i=0;i<2000000;i++);
     OLED_Init();
@@ -318,55 +409,76 @@ int main(void) {
     }
     OLED_DrawHeaderRule();
     uint8_t err=RTC_Init_LSE(); if(err){OLED_ShowChar(0,0,10);OLED_ShowChar(8,0,err);while(1){LED_TOGGLE();delay(500000);}}
-    uint8_t last_sec=0xFF,last_min=0xFF,last_day=0xFF,setting=0,asleep=0,item=0,last_blink=0xFF;
-    ButtonState wake_button, set_button;
-    wake_button.candidate=0; wake_button.pressed=0; wake_button.stable=0; wake_button.long_sent=0; wake_button.last_phase=0; wake_button.held_ticks=0;
-    set_button.candidate=0; set_button.pressed=0; set_button.stable=0; set_button.long_sent=0; set_button.last_phase=0; set_button.held_ticks=0;
+    rtc_debug_rcc_csr=RCC_CSR; rtc_debug_prer=RTC_PRER;
+    uint8_t last_sec=0xFF,last_day=0xFF,setting=0,asleep=0,item=0,last_blink=0xFF;
+    uint8_t edit_y=0,edit_mo=1,edit_da=1,edit_wd=1,edit_h=0,edit_mi=0,edit_se=0,edit_se_changed=0;
+    uint32_t last_key_sample=0;
+    static ButtonState wake_button, set_button;
     while(1) {
+        uint32_t tr,dr,ssr;
         uint8_t y,mo,da,wd,h,mi,se;
-        RTC_ReadCalendar(&y,&mo,&da,&wd,&h,&mi,&se);
-        uint16_t phase=RTC_Phase(se);
-        uint8_t wake_evt=ButtonUpdate(&wake_button,BUTTON_WAKE_MASK,phase);
-        uint8_t set_evt=ButtonUpdate(&set_button,BUTTON_SET_MASK,phase);
+        RTC_ReadSnapshot(&tr,&dr,&ssr);
+        rtc_debug_ssr=ssr;
+        RTC_DecodeSnapshot(tr,dr,&y,&mo,&da,&wd,&h,&mi,&se);
+        uint32_t now=g_ms;
+        uint8_t wake_evt=0,set_evt=0;
+        if ((uint32_t)(now-last_key_sample)>=5u) {
+            last_key_sample=now;
+            wake_evt=Key_Update(&wake_button,ButtonDown(BUTTON_WAKE_MASK),now);
+            set_evt=Key_Update(&set_button,ButtonDown(BUTTON_SET_MASK),now);
+        }
 
         if (asleep) {
-            if (wake_evt==1) { asleep=0; OLED_Wake(); OLED_DrawHeaderRule(); last_sec=0xFF; last_min=0xFF; last_day=0xFF; }
-            delay(20000);
+            if (wake_evt==1) { asleep=0; OLED_Wake(); OLED_ResetRendered(); last_sec=0xFF; last_day=0xFF; }
+            __asm volatile("wfi");
             continue;
         }
-        if (wake_evt==1) { OLED_Sleep(); asleep=1; delay(20000); continue; }
+        if (wake_evt==1) { OLED_ClearQueue(); OLED_Sleep(); asleep=1; continue; }
 
         if (!setting && set_evt==2) {
-            setting=1; item=0; se=0; RTC_WriteCalendar(y,mo,da,wd,h,mi,se);
-            last_sec=0xFF; last_min=0xFF; last_day=0xFF; last_blink=0xFF;
+            OLED_ClearQueue();
+            setting=1; item=0;
+            edit_y=y; edit_mo=mo; edit_da=da; edit_wd=wd; edit_h=h; edit_mi=mi; edit_se=se; edit_se_changed=0;
+            last_day=0xFF; last_blink=0xFF;
         } else if (setting && set_evt) {
             if (set_evt==1) {
-                if(item==0)y=(y>=99)?0:y+1;
-                else if(item==1)mo=(mo>=12)?1:mo+1;
-                else if(item==2){uint8_t mx=DateDays(y,mo);da=(da>=mx)?1:da+1;}
-                else if(item==3)wd=(wd>=7)?1:wd+1;
-                else if(item==4)h=(h>=23)?0:h+1;
-                else if(item==5)mi=(mi>=59)?0:mi+1;
-                else se=0;
-                RTC_WriteCalendar(y,mo,da,wd,h,mi,se);
-                last_sec=0xFF; last_min=0xFF; last_day=0xFF;
+                if(item==0)edit_y=(edit_y>=99)?0:edit_y+1;
+                else if(item==1)edit_mo=(edit_mo>=12)?1:edit_mo+1;
+                else if(item==2){uint8_t mx=DateDays(edit_y,edit_mo);edit_da=(edit_da>=mx)?1:edit_da+1;}
+                else if(item==3)edit_wd=(edit_wd>=7)?1:edit_wd+1;
+                else if(item==4)edit_h=(edit_h>=23)?0:edit_h+1;
+                else if(item==5)edit_mi=(edit_mi>=59)?0:edit_mi+1;
+                else {edit_se=0;edit_se_changed=1;}
+                if(item<3)last_day=0xFF;
+                last_blink=0xFF;
             } else if(item>=6) {
-                setting=0; item=0; RTC_WriteCalendar(y,mo,da,wd,h,mi,se);
-                last_sec=0xFF; last_min=0xFF; last_day=0xFF;
+                OLED_ClearQueue();
+                setting=0; item=0;
+                RTC_WriteCalendar(edit_y,edit_mo,edit_da,edit_wd,edit_h,edit_mi,edit_se_changed?edit_se:se);
+                last_sec=0xFF; last_day=0xFF; OLED_ResetRendered();
             } else { item++; last_blink=0xFF; }
         }
 
-        if(se!=last_sec) {
-            last_sec=se; LED_TOGGLE();
-            if(mi!=last_min){last_min=mi;OLED_ShowTime_Big(Dec_To_BCD(h),Dec_To_BCD(mi));}
-            OLED_ShowChar_Big(4,6,se/10,2); OLED_ShowChar_Big(16,6,se%10,2); OLED_ShowProgress(se);
-            if(da!=last_day){last_day=da;OLED_ShowDate(RTC_DR);}
+        if(setting && set_evt==2 && item<6) { OLED_ClearQueue(); last_blink=0xFF; }
+        uint8_t show_da=setting?edit_da:da;
+        uint8_t show_y=setting?edit_y:y,show_mo=setting?edit_mo:mo;
+        uint8_t show_h=setting?edit_h:h,show_mi=setting?edit_mi:mi;
+        uint8_t show_se=(setting&&edit_se_changed)?edit_se:se;
+        if(se!=last_sec) { last_sec=se; LED_TOGGLE(); }
+        OLED_ShowTime_Big(Dec_To_BCD(show_h),Dec_To_BCD(show_mi));
+        OLED_ShowSeconds(show_se);
+        OLED_ShowProgress(show_se);
+        if(show_da!=last_day) {
+            uint32_t display_dr=((uint32_t)Dec_To_BCD(show_y)<<16)|((uint32_t)(setting?edit_wd:wd)<<13)|
+                                ((uint32_t)Dec_To_BCD(show_mo)<<8)|Dec_To_BCD(show_da);
+            last_day=show_da; OLED_ShowDate(display_dr);
         }
         if(setting) {
-            uint8_t blink=(uint8_t)((phase/128u)&1u);
-            if(blink!=last_blink){last_blink=blink;OLED_BlinkSettingField(item,blink,y,mo,da,wd,h,mi,se);}
+            uint8_t blink=(uint8_t)(((now/500u)&1u));
+            if(blink!=last_blink){last_blink=blink;OLED_BlinkSettingField(item,blink,edit_y,edit_mo,edit_da,edit_wd,edit_h,edit_mi,show_se);}
         }
-        delay(20000);
+        (void)OLED_DisplayTask();
+        __asm volatile("wfi");
     }
 }
 

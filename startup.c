@@ -12,6 +12,7 @@ extern uint32_t _ebss;
 
 void Reset_Handler(void);
 void Default_Handler(void);
+void SysTick_Handler(void);
 
 /* ---- 复位入口：先做 C 运行时初始化，再调 main ---- */
 void Reset_Handler(void)
@@ -52,5 +53,16 @@ void (* const g_pfnVectors[])(void) = {
     Reset_Handler,                /* 1  Reset   */
     Default_Handler,              /* 2  NMI     */
     Default_Handler,              /* 3  HardFault */
-    /* ... 后续与之前版本相同 ... */
+    0,                            /* 4  Reserved */
+    0,                            /* 5  Reserved */
+    0,                            /* 6  Reserved */
+    0,                            /* 7  Reserved */
+    0,                            /* 8  Reserved */
+    0,                            /* 9  Reserved */
+    0,                            /* 10 Reserved */
+    Default_Handler,              /* 11 SVCall */
+    0,                            /* 12 Reserved */
+    0,                            /* 13 Reserved */
+    Default_Handler,              /* 14 PendSV */
+    SysTick_Handler               /* 15 SysTick */
 };
