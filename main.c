@@ -2,6 +2,7 @@
 #include "button_state.h"
 #include "display_logic.h"
 #include "ds3231_calendar.h"
+#include "weekday_display.h"
 
 // --- 寄存器 ---
 #define RCC_IOPENR   (*(volatile uint32_t *)0x4002102C)
@@ -64,13 +65,19 @@ static uint8_t ButtonDown(uint32_t mask) {
     return (GPIOA_IDR & mask) == 0;
 }
 
-const uint8_t Font6x8[16][6] = {
+const uint8_t Font6x8[28][6] = {
     {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
     {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
     {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
     {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
     {0x7F,0x40,0x40,0x40,0x40}, {0x3E,0x41,0x49,0x49,0x32}, {0x3F,0x41,0x41,0x22,0x1C},
-    {0x00,0x60,0x60,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00}
+    {0x00,0x60,0x60,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00},
+    {0x7E,0x11,0x11,0x11,0x7E}, {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x09,0x01}, {0x7F,0x08,0x08,0x08,0x7F},
+    {0x00,0x41,0x7F,0x41,0x00}, {0x7F,0x02,0x0C,0x02,0x7F},
+    {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x19,0x29,0x46}, {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F}, {0x7F,0x20,0x18,0x20,0x7F}
 };
 
 typedef struct { uint8_t x, page, glyph, scale, offset; } DisplayJob;
@@ -178,6 +185,18 @@ void OLED_ShowText(uint8_t x, uint8_t page_y, const uint8_t *text) {
         else if (*text == 'S') idx = 12;
         else if (*text == 'D') idx = 13;
         else if (*text == '.') idx = 14;
+        else if (*text == 'A') idx = 16;
+        else if (*text == 'E') idx = 17;
+        else if (*text == 'F') idx = 18;
+        else if (*text == 'H') idx = 19;
+        else if (*text == 'I') idx = 20;
+        else if (*text == 'M') idx = 21;
+        else if (*text == 'N') idx = 22;
+        else if (*text == 'O') idx = 23;
+        else if (*text == 'R') idx = 24;
+        else if (*text == 'T') idx = 25;
+        else if (*text == 'U') idx = 26;
+        else if (*text == 'W') idx = 27;
         else { x += 6; text++; continue; }
         OLED_ShowChar(x, page_y, idx);
         x += 6;
@@ -187,10 +206,11 @@ void OLED_ShowText(uint8_t x, uint8_t page_y, const uint8_t *text) {
 uint8_t BCD_To_Dec(uint8_t value) {
     return (uint8_t)(((value >> 4) & 0x0F) * 10 + (value & 0x0F));
 }
-void OLED_ShowDate(uint32_t dr) {
+void OLED_ShowDate(uint32_t dr, uint8_t editing_weekday) {
     uint8_t year = BCD_To_Dec((uint8_t)(dr >> 16));
     uint8_t month = BCD_To_Dec((uint8_t)((dr >> 8) & 0x1F));
     uint8_t day = BCD_To_Dec((uint8_t)(dr & 0x3F));
+    uint8_t weekday = (uint8_t)((dr >> 13) & 7u);
     OLED_ShowText(2, 0, (const uint8_t *)"20");
     OLED_ShowChar(14, 0, (uint8_t)(year / 10));
     OLED_ShowChar(20, 0, (uint8_t)(year % 10));
@@ -200,7 +220,20 @@ void OLED_ShowDate(uint32_t dr) {
     OLED_ShowText(44, 0, (const uint8_t *)".");
     OLED_ShowChar(50, 0, (uint8_t)(day / 10));
     OLED_ShowChar(56, 0, (uint8_t)(day % 10));
-    OLED_ShowText(96, 0, (const uint8_t *)"DS");
+    OLED_ShowText(78, 0, (const uint8_t *)"DS");
+    if (editing_weekday) {
+        OLED_ShowChar(100, 0, 15);
+        OLED_ShowChar(106, 0, 15);
+        OLED_ShowChar(112, 0, 15);
+    } else {
+        const char *abbreviation = WeekdayAbbreviation(weekday);
+        if (abbreviation) OLED_ShowText(100, 0, (const uint8_t *)abbreviation);
+        else {
+            OLED_ShowChar(100, 0, 15);
+            OLED_ShowChar(106, 0, 15);
+            OLED_ShowChar(112, 0, 15);
+        }
+    }
 }
 void OLED_ShowProgress(uint8_t sec) {
     progress_target=ProgressTarget(sec);
@@ -302,7 +335,7 @@ static uint8_t DS3231_ReadCalendar(DS3231Calendar *calendar) {
 }
 static uint8_t DS3231_Init(void) {
     uint8_t status,control;
-    DS3231Calendar preset={26,10,18,1,16,20,0};
+    DS3231Calendar preset={26,10,18,7,16,20,0};
     if (!DS3231_ReadRegs(DS3231_REG_STATUS,&status,1)) return 1;
     ds3231_debug_status=status;
     if (status&0x80u) {
@@ -397,7 +430,7 @@ int main(void) {
                 else if(item==4)edit_h=(edit_h>=23)?0:edit_h+1;
                 else if(item==5)edit_mi=(edit_mi>=59)?0:edit_mi+1;
                 else {edit_se=0;edit_se_changed=1;}
-                if(item<3)last_day=0xFF;
+                if(item<4)last_day=0xFF;
                 last_blink=0xFF;
             } else if(item>=6) {
                 OLED_ClearQueue();
@@ -406,7 +439,12 @@ int main(void) {
                 if (!DS3231_WriteCalendar(&current)) ds3231_last_error=7;
                 else ds3231_last_error=0;
                 last_sec=0xFF; last_day=0xFF; OLED_ResetRendered();
-            } else { item++; last_blink=0xFF; }
+            } else {
+                uint8_t previous_item=item;
+                item++;
+                last_blink=0xFF;
+                if(previous_item==3 || item==3) last_day=0xFF;
+            }
         }
 
         if(setting && set_evt==2 && item<6) { OLED_ClearQueue(); last_blink=0xFF; }
@@ -421,7 +459,7 @@ int main(void) {
         if(show_da!=last_day) {
             uint32_t display_dr=((uint32_t)Dec_To_BCD(show_y)<<16)|((uint32_t)(setting?edit_wd:wd)<<13)|
                                 ((uint32_t)Dec_To_BCD(show_mo)<<8)|Dec_To_BCD(show_da);
-            last_day=show_da; OLED_ShowDate(display_dr);
+            last_day=show_da; OLED_ShowDate(display_dr, (uint8_t)(setting && item==3));
         }
         if(setting) {
             uint8_t blink=(uint8_t)(((now/500u)&1u));

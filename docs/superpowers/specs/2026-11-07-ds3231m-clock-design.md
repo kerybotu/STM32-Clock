@@ -29,7 +29,7 @@ Replace the STM32L010F4 internal RTC/LSE time source with an external DS3231M so
 
 - Add DS3231M byte read/write helpers using 7-bit address 0x68, sequential BCD calendar access, and ACK/NACK handling.
 - Read time/date as one seven-byte burst and status separately during initialization.
-- If OSF is set, initialize 24-hour calendar to 2026-10-18 16:20:00 (Sunday=1), then clear OSF and disable unused 32.768 kHz output.
+- Weekday numbering is Monday=1 through Sunday=7; if OSF is set, initialize 2026-10-18 16:20:00 with Sunday=7, then clear OSF and disable unused 32.768 kHz output.
 - Route `RTC_ReadSnapshot` and calendar writes through DS3231M. Remove internal RTC/LSE initialization from the active startup path; leave PC14/PC15 unused by firmware.
 - Keep SysTick key scanning and the queued OLED display path unchanged except for using DS3231M snapshot fields.
 - Add host-side tests for BCD/calendar encoding and register snapshot decoding.

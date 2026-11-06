@@ -3,13 +3,13 @@
 #include "../ds3231_calendar.h"
 
 static void test_preset_calendar_encoding(void) {
-    const DS3231Calendar preset = {26, 10, 18, 1, 16, 20, 0};
+    const DS3231Calendar preset = {26, 10, 18, 7, 16, 20, 0};
     uint8_t regs[7];
     assert(DS3231_EncodeCalendar(&preset, regs));
     assert(regs[0] == 0x00);
     assert(regs[1] == 0x20);
     assert(regs[2] == 0x16);
-    assert(regs[3] == 0x01);
+    assert(regs[3] == 0x07);
     assert(regs[4] == 0x18);
     assert(regs[5] == 0x10);
     assert(regs[6] == 0x26);
