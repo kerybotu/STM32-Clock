@@ -7,6 +7,8 @@
 #define RCC_IOPENR   (*(volatile uint32_t *)0x4002102C)
 #define RCC_CR       (*(volatile uint32_t *)0x40021000)
 #define RCC_CFGR     (*(volatile uint32_t *)0x4002100C)
+#define RCC_CR_HSI16ON   (1u << 0)
+#define RCC_CR_HSI16RDYF (1u << 2)
 
 #define GPIOA_MODER  (*(volatile uint32_t *)0x50000000)
 #define GPIOA_OTYPER (*(volatile uint32_t *)0x50000004)
@@ -43,8 +45,8 @@ volatile uint8_t ds3231_debug_status, ds3231_last_error;
 void SysTick_Handler(void) { g_ms++; }
 
 static void Clock_Init_16MHz(void) {
-    RCC_CR |= (1u << 8);                         // HSI16 ON (STM32L0 RCC_CR)
-    while (!(RCC_CR & (1u << 10))) {}            // wait HSIRDY
+    RCC_CR |= RCC_CR_HSI16ON;                    // STM32L010 RCC_CR bit 0
+    while (!(RCC_CR & RCC_CR_HSI16RDYF)) {}      // HSI16 ready flag, bit 2
     RCC_CFGR = (RCC_CFGR & ~3u) | 1u;            // SYSCLK = HSI16
     while ((RCC_CFGR & (3u << 2)) != (1u << 2)) {}
 }
