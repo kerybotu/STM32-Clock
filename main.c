@@ -1,21 +1,12 @@
 #include <stdint.h>
 #include "button_state.h"
 #include "display_logic.h"
+#include "ds3231_calendar.h"
 
 // --- 寄存器 ---
 #define RCC_IOPENR   (*(volatile uint32_t *)0x4002102C)
-#define RCC_APB1ENR  (*(volatile uint32_t *)0x40021038)
-#define RCC_CSR      (*(volatile uint32_t *)0x40021050)
 #define RCC_CR       (*(volatile uint32_t *)0x40021000)
 #define RCC_CFGR     (*(volatile uint32_t *)0x4002100C)
-#define RCC_CSR_RTCRST (1u << 19)
-#define RCC_CSR_RTCEN  (1u << 18)
-#define RCC_CSR_RTCSEL (3u << 16)
-#define RCC_CSR_LSEDRV (3u << 11)
-#define RCC_CSR_LSEBYP (1u << 10)
-#define RCC_CSR_LSERDY (1u << 9)
-#define RCC_CSR_LSEON  (1u << 8)
-#define PWR_CR       (*(volatile uint32_t *)0x40007000)
 
 #define GPIOA_MODER  (*(volatile uint32_t *)0x50000000)
 #define GPIOA_OTYPER (*(volatile uint32_t *)0x50000004)
@@ -23,12 +14,6 @@
 #define GPIOA_IDR    (*(volatile uint32_t *)0x50000010)
 #define GPIOA_ODR    (*(volatile uint32_t *)0x50000014)
 
-#define RTC_TR       (*(volatile uint32_t *)0x40002800)
-#define RTC_DR       (*(volatile uint32_t *)0x40002804)
-#define RTC_ISR      (*(volatile uint32_t *)0x4000280C)
-#define RTC_PRER     (*(volatile uint32_t *)0x40002810)
-#define RTC_WPR      (*(volatile uint32_t *)0x40002824)
-#define RTC_SSR      (*(volatile uint32_t *)0x40002828)
 #define SYST_CSR     (*(volatile uint32_t *)0xE000E010)
 #define SYST_RVR     (*(volatile uint32_t *)0xE000E014)
 #define SYST_CVR     (*(volatile uint32_t *)0xE000E018)
@@ -39,12 +24,21 @@
 #define SDA_H() (GPIOA_ODR |= (1<<10))
 #define SDA_L() (GPIOA_ODR &= ~(1<<10))
 #define SDA_READ() ((GPIOA_IDR & (1<<10)) ? 1 : 0)
+#define OLED_SCL_MASK (1u << 9)
+#define OLED_SDA_MASK (1u << 10)
+#define DS_SCL_MASK   (1u << 5)
+#define DS_SDA_MASK   (1u << 6)
+#define DS3231_ADDR_W 0xD0u
+#define DS3231_ADDR_R 0xD1u
+#define DS3231_REG_TIME 0x00u
+#define DS3231_REG_CONTROL 0x0Eu
+#define DS3231_REG_STATUS 0x0Fu
 #define I2C_DELAY_COUNT 4
 #define BUTTON_WAKE_MASK (1u << 0)
 #define BUTTON_SET_MASK  (1u << 4)
 
 volatile uint32_t g_ms;
-volatile uint32_t rtc_debug_rcc_csr, rtc_debug_prer, rtc_debug_ssr;
+volatile uint8_t ds3231_debug_status, ds3231_last_error;
 
 void SysTick_Handler(void) { g_ms++; }
 
@@ -73,7 +67,7 @@ const uint8_t Font6x8[16][6] = {
     {0x21,0x41,0x45,0x4B,0x31}, {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39},
     {0x3C,0x4A,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
     {0x06,0x49,0x49,0x29,0x1E}, {0x00,0x36,0x36,0x00,0x00},
-    {0x7F,0x40,0x40,0x40,0x40}, {0x3E,0x41,0x49,0x49,0x32}, {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x40,0x40,0x40,0x40}, {0x3E,0x41,0x49,0x49,0x32}, {0x3F,0x41,0x41,0x22,0x1C},
     {0x00,0x60,0x60,0x00,0x00}, {0x00,0x00,0x00,0x00,0x00}
 };
 
@@ -98,19 +92,30 @@ static void OLED_QueueGlyph(uint8_t x, uint8_t page, uint8_t glyph, uint8_t scal
 
 static void OLED_ClearQueue(void) { display_head=0; display_tail=0; }
 
-void I2C_Start() { SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT); SDA_L(); delay(I2C_DELAY_COUNT); SCL_L(); }
-void I2C_Stop()  { SCL_L(); SDA_L(); delay(I2C_DELAY_COUNT); SCL_H(); delay(I2C_DELAY_COUNT); SDA_H(); }
-uint8_t I2C_WriteByte(uint8_t dat) {
+static void BusSCL(uint32_t mask, uint8_t high) { if (high) GPIOA_ODR |= mask; else GPIOA_ODR &= ~mask; }
+static void BusSDA(uint32_t mask, uint8_t high) { if (high) GPIOA_ODR |= mask; else GPIOA_ODR &= ~mask; }
+static uint8_t BusReadSDA(uint32_t mask) { return (GPIOA_IDR & mask) ? 1u : 0u; }
+static void BusStart(uint32_t scl, uint32_t sda) { BusSDA(sda,1); BusSCL(scl,1); delay(I2C_DELAY_COUNT); BusSDA(sda,0); delay(I2C_DELAY_COUNT); BusSCL(scl,0); }
+static void BusStop(uint32_t scl, uint32_t sda) { BusSCL(scl,0); BusSDA(sda,0); delay(I2C_DELAY_COUNT); BusSCL(scl,1); delay(I2C_DELAY_COUNT); BusSDA(sda,1); }
+static uint8_t BusWriteByte(uint32_t scl, uint32_t sda, uint8_t dat) {
     for(uint8_t i=0; i<8; i++) {
-        if(dat & 0x80) SDA_H(); else SDA_L();
-        SCL_H(); delay(I2C_DELAY_COUNT); SCL_L(); delay(I2C_DELAY_COUNT);
+        BusSDA(sda,(dat & 0x80u)!=0); BusSCL(scl,1); delay(I2C_DELAY_COUNT); BusSCL(scl,0); delay(I2C_DELAY_COUNT);
         dat <<= 1;
     }
-    SDA_H(); SCL_H(); delay(I2C_DELAY_COUNT);
-    uint8_t ack = SDA_READ();
-    SCL_L(); delay(I2C_DELAY_COUNT);
+    BusSDA(sda,1); BusSCL(scl,1); delay(I2C_DELAY_COUNT);
+    uint8_t ack = BusReadSDA(sda);
+    BusSCL(scl,0); delay(I2C_DELAY_COUNT);
     return ack;
 }
+static uint8_t BusReadByte(uint32_t scl, uint32_t sda, uint8_t ack) {
+    uint8_t value=0; BusSDA(sda,1);
+    for(uint8_t i=0;i<8;i++) { value=(uint8_t)(value<<1); BusSCL(scl,1); delay(I2C_DELAY_COUNT); value|=BusReadSDA(sda); BusSCL(scl,0); delay(I2C_DELAY_COUNT); }
+    BusSDA(sda,(uint8_t)!ack); BusSCL(scl,1); delay(I2C_DELAY_COUNT); BusSCL(scl,0); delay(I2C_DELAY_COUNT); BusSDA(sda,1);
+    return value;
+}
+void I2C_Start() { BusStart(OLED_SCL_MASK,OLED_SDA_MASK); }
+void I2C_Stop()  { BusStop(OLED_SCL_MASK,OLED_SDA_MASK); }
+uint8_t I2C_WriteByte(uint8_t dat) { return BusWriteByte(OLED_SCL_MASK,OLED_SDA_MASK,dat); }
 static uint8_t OLED_Tx(uint8_t value) {
     if (I2C_WriteByte(value)) { oled_i2c_error=1; return 0; }
     return 1;
@@ -169,7 +174,7 @@ void OLED_ShowText(uint8_t x, uint8_t page_y, const uint8_t *text) {
         else if (*text == ':') idx = 10;
         else if (*text == 'L') idx = 11;
         else if (*text == 'S') idx = 12;
-        else if (*text == 'E') idx = 13;
+        else if (*text == 'D') idx = 13;
         else if (*text == '.') idx = 14;
         else { x += 6; text++; continue; }
         OLED_ShowChar(x, page_y, idx);
@@ -193,7 +198,7 @@ void OLED_ShowDate(uint32_t dr) {
     OLED_ShowText(44, 0, (const uint8_t *)".");
     OLED_ShowChar(50, 0, (uint8_t)(day / 10));
     OLED_ShowChar(56, 0, (uint8_t)(day % 10));
-    OLED_ShowText(96, 0, (const uint8_t *)"LSE");
+    OLED_ShowText(96, 0, (const uint8_t *)"DS");
 }
 void OLED_ShowProgress(uint8_t sec) {
     progress_target=ProgressTarget(sec);
@@ -266,118 +271,58 @@ static uint8_t OLED_DisplayTask(void) {
     return 1;
 }
 
-/* --- RTC 初始化：使用外部 LSE --- */
-uint8_t RTC_Init_LSE(void) {
-    volatile uint32_t timeout;
-    uint8_t initialize_calendar = 0;
-    uint8_t initialize_date = 0;
-
-    // 1. 使能 PWR 和备份域访问
-    RCC_APB1ENR |= (1 << 28);       // PWREN
-    PWR_CR |= (1 << 8);             // DBP = 1
-    for (volatile int i = 0; i < 500; i++);
-
-    // RTC 时钟源一经选择便锁定；仅在尚未选择 LSE 时复位备份域。
-    if ((RCC_CSR & RCC_CSR_RTCSEL) != (1u << 16)) {
-        RCC_CSR |= RCC_CSR_RTCRST;
-        for (volatile int i = 0; i < 500; i++);
-        RCC_CSR &= ~RCC_CSR_RTCRST;
-        for (volatile int i = 0; i < 500; i++);
-        initialize_calendar = 1;
+static uint8_t Dec_To_BCD(uint8_t v) { return DS3231_ToBCD(v); }
+static uint8_t DS3231_WriteRegs(uint8_t reg, const uint8_t *data, uint8_t length) {
+    BusStart(DS_SCL_MASK,DS_SDA_MASK);
+    if (BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,DS3231_ADDR_W) ||
+        BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,reg)) { BusStop(DS_SCL_MASK,DS_SDA_MASK); return 0; }
+    while (length--) if (BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,*data++)) { BusStop(DS_SCL_MASK,DS_SDA_MASK); return 0; }
+    BusStop(DS_SCL_MASK,DS_SDA_MASK);
+    return 1;
+}
+static uint8_t DS3231_ReadRegs(uint8_t reg, uint8_t *data, uint8_t length) {
+    BusStart(DS_SCL_MASK,DS_SDA_MASK);
+    if (BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,DS3231_ADDR_W) ||
+        BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,reg)) { BusStop(DS_SCL_MASK,DS_SDA_MASK); return 0; }
+    BusStart(DS_SCL_MASK,DS_SDA_MASK);
+    if (BusWriteByte(DS_SCL_MASK,DS_SDA_MASK,DS3231_ADDR_R)) { BusStop(DS_SCL_MASK,DS_SDA_MASK); return 0; }
+    while (length) { *data++=BusReadByte(DS_SCL_MASK,DS_SDA_MASK,length>1u); length--; }
+    BusStop(DS_SCL_MASK,DS_SDA_MASK);
+    return 1;
+}
+static uint8_t DS3231_WriteCalendar(const DS3231Calendar *calendar) {
+    uint8_t regs[7];
+    return DS3231_EncodeCalendar(calendar,regs) && DS3231_WriteRegs(DS3231_REG_TIME,regs,7);
+}
+static uint8_t DS3231_ReadCalendar(DS3231Calendar *calendar) {
+    uint8_t regs[7];
+    return DS3231_ReadRegs(DS3231_REG_TIME,regs,7) && DS3231_DecodeCalendar(regs,calendar);
+}
+static uint8_t DS3231_Init(void) {
+    uint8_t status,control;
+    DS3231Calendar preset={26,10,18,1,16,20,0};
+    if (!DS3231_ReadRegs(DS3231_REG_STATUS,&status,1)) return 1;
+    ds3231_debug_status=status;
+    if (status&0x80u) {
+        if (!DS3231_WriteCalendar(&preset)) return 2;
     }
-
-    // 试用中高驱动档；驱动档仅能在 LSE 关闭时修改。
-    if ((RCC_CSR & RCC_CSR_LSEON) &&
-        (RCC_CSR & RCC_CSR_LSEDRV) != (2u << 11)) {
-        RCC_CSR &= ~RCC_CSR_LSEON;
-        timeout = 0xFFFFFF;
-        while ((RCC_CSR & RCC_CSR_LSERDY) && --timeout) {}
-        if (!timeout) return 6;
-    }
-    if (!(RCC_CSR & RCC_CSR_LSEON)) {
-        RCC_CSR &= ~RCC_CSR_LSEBYP;
-        RCC_CSR &= ~RCC_CSR_LSEDRV;
-        RCC_CSR |= (2u << 11);
-        RCC_CSR |= RCC_CSR_LSEON;
-    }
-
-    // 等待 LSE 就绪
-    timeout = 0xFFFFFF;
-    while (!(RCC_CSR & RCC_CSR_LSERDY) && --timeout);
-    if (timeout == 0) return 1;
-
-    // 选择并使能 RTC 时钟；已在使用 LSE 时保留原有计时状态。
-    if ((RCC_CSR & RCC_CSR_RTCSEL) == 0) {
-        RCC_CSR |= (1u << 16);      // RTCSEL = 01 (LSE)
-    }
-    RCC_CSR |= RCC_CSR_RTCEN;
-
-    // 同步 RTC 寄存器后，仅在日历尚未初始化時设置初始时间。
-    RTC_ISR &= ~(1u << 5);
-    timeout = 0xFFFFFF;
-    while (!(RTC_ISR & (1 << 5)) && --timeout);
-    if (timeout == 0) return 4;
-
-    if (!initialize_calendar && (RTC_ISR & (1u << 4))) {
-        uint32_t dr = RTC_DR;
-        if ((dr & 0x1F00u) != 0 && (dr & 0x3Fu) != 0) return 0;
-        initialize_date = 1;
-    } else {
-        initialize_calendar = 1;
-    }
-
-    // 解锁 RTC，进入初始化模式
-    RTC_WPR = 0xCA; RTC_WPR = 0x53;
-    RTC_ISR |= (1 << 7);            // INIT = 1
-    timeout = 0xFFFFFF;
-    while (!(RTC_ISR & (1 << 6)) && --timeout);   // 等 INITF
-    if (timeout == 0) return 5;
-
-    if (initialize_calendar) {
-        // LSE 32768 / ((127 + 1) * (255 + 1)) = 1 Hz。
-        RTC_PRER = (127 << 16) | 255;
-        RTC_TR = (0x16u << 16) | (0x20u << 8); // 首次初始化为 16:20:00 (BCD)
-    }
-    if (initialize_calendar || initialize_date) {
-        RTC_DR = (0x26u << 16) | (7u << 13) | (0x10u << 8) | 0x18u;
-    }
-
-    // 退出初始化模式并等待同步完成。
-    RTC_ISR &= ~(1 << 7);           // INIT = 0
-    timeout = 0xFFFFFF;
-    while ((RTC_ISR & (1 << 6)) && --timeout);
-    RTC_ISR &= ~(1u << 5);
-    timeout = 0xFFFFFF;
-    while (!(RTC_ISR & (1u << 5)) && --timeout);
-    RTC_WPR = 0xFF;
-    if (timeout == 0) return 4;
-
+    if (!DS3231_ReadRegs(DS3231_REG_CONTROL,&control,1)) return 3;
+    control&=(uint8_t)~0x80u; /* EOSC=0 keeps the oscillator running on VBAT. */
+    if (!DS3231_WriteRegs(DS3231_REG_CONTROL,&control,1)) return 4;
+    status=0; /* Clear OSF and alarm flags while keeping EN32KHZ disabled. */
+    if (!DS3231_WriteRegs(DS3231_REG_STATUS,&status,1)) return 5;
+    if (!DS3231_ReadCalendar(&preset)) return 6;
     return 0;
 }
-
-
-static uint8_t Dec_To_BCD(uint8_t v) { return (uint8_t)(((v / 10u) << 4) | (v % 10u)); }
-static void RTC_WriteCalendar(uint8_t year, uint8_t month, uint8_t day, uint8_t weekday, uint8_t hour, uint8_t minute, uint8_t second) {
-    volatile uint32_t timeout = 0xFFFFFF; RTC_WPR=0xCA; RTC_WPR=0x53; RTC_ISR |= (1u<<7);
-    while (!(RTC_ISR&(1u<<6)) && --timeout) {}
-    if (timeout) { RTC_TR=((uint32_t)Dec_To_BCD(hour)<<16)|((uint32_t)Dec_To_BCD(minute)<<8)|Dec_To_BCD(second); RTC_DR=((uint32_t)Dec_To_BCD(year)<<16)|((uint32_t)(weekday&7u)<<13)|((uint32_t)Dec_To_BCD(month)<<8)|Dec_To_BCD(day); RTC_ISR&=~(1u<<7); timeout=0xFFFFFF; while((RTC_ISR&(1u<<6))&&--timeout){} RTC_ISR&=~(1u<<5); timeout=0xFFFFFF; while(!(RTC_ISR&(1u<<5))&&--timeout){} } RTC_WPR=0xFF;
+static void DS3231_ToDisplay(const DS3231Calendar *c,uint32_t *tr,uint32_t *dr) {
+    *tr=((uint32_t)Dec_To_BCD(c->hour)<<16)|((uint32_t)Dec_To_BCD(c->minute)<<8)|Dec_To_BCD(c->second);
+    *dr=((uint32_t)Dec_To_BCD(c->year)<<16)|((uint32_t)c->weekday<<13)|((uint32_t)Dec_To_BCD(c->month)<<8)|Dec_To_BCD(c->day);
 }
-static void RTC_ReadSnapshot(uint32_t *tr, uint32_t *dr, uint32_t *ssr) {
-    uint32_t first, last;
-    do {
-        first = RTC_TR;
-        *dr = RTC_DR;
-        *ssr = RTC_SSR;
-        last = RTC_TR;
-    } while (first != last);
-    *tr = first;
-}
-
 static void RTC_DecodeSnapshot(uint32_t tr, uint32_t dr,
                                uint8_t *year,uint8_t *month,uint8_t *day,uint8_t *weekday,
                                uint8_t *hour,uint8_t *minute,uint8_t *second) {
-    *year=BCD_To_Dec((uint8_t)(dr>>16)); *month=BCD_To_Dec((uint8_t)((dr>>8)&0x1F));
-    *day=BCD_To_Dec((uint8_t)(dr&0x3F)); *weekday=(uint8_t)((dr>>13)&7);
+    *year=BCD_To_Dec((uint8_t)(dr>>16)); *month=BCD_To_Dec((uint8_t)((dr>>8)&0x1Fu));
+    *day=BCD_To_Dec((uint8_t)(dr&0x3Fu)); *weekday=(uint8_t)((dr>>13)&7u);
     *hour=BCD_To_Dec((uint8_t)(tr>>16)); *minute=BCD_To_Dec((uint8_t)(tr>>8));
     *second=BCD_To_Dec((uint8_t)tr);
 }
@@ -400,7 +345,7 @@ static uint8_t DateDays(uint8_t y,uint8_t m){static const uint8_t d[12]={31,28,3
 int main(void) {
     Clock_Init_16MHz();
     SysTick_Init_1ms();
-    RCC_IOPENR|=(1<<0); GPIOA_MODER&=~((3u<<0)|(3u<<2)|(3u<<8)); GPIOA_MODER|=(1u<<2); GPIOA_MODER&=~((3u<<18)|(3u<<20)); GPIOA_MODER|=((1u<<18)|(1u<<20)); GPIOA_OTYPER|=(1<<9)|(1<<10); GPIOA_PUPDR&=~((3u<<0)|(3u<<8)|(3u<<18)|(3u<<20)); GPIOA_PUPDR|=(1u<<0)|(1u<<8)|(1u<<18)|(1u<<20);
+    RCC_IOPENR|=(1u<<0); GPIOA_MODER&=~((3u<<0)|(3u<<2)|(3u<<8)|(3u<<10)|(3u<<12)|(3u<<18)|(3u<<20)); GPIOA_MODER|=(1u<<2)|(1u<<10)|(1u<<12)|(1u<<18)|(1u<<20); GPIOA_OTYPER|=(1u<<5)|(1u<<6)|(1u<<9)|(1u<<10); GPIOA_ODR|=DS_SCL_MASK|DS_SDA_MASK|OLED_SCL_MASK|OLED_SDA_MASK; GPIOA_PUPDR&=~((3u<<0)|(3u<<8)|(3u<<18)|(3u<<20)); GPIOA_PUPDR|=(1u<<0)|(1u<<8)|(1u<<18)|(1u<<20);
     for(volatile int i=0;i<2000000;i++);
     OLED_Init();
     for(uint8_t i=0;i<8;i++){
@@ -408,17 +353,18 @@ int main(void) {
         OLED_WriteCmds(cmds, sizeof(cmds)); OLED_WriteDataFill(0,128);
     }
     OLED_DrawHeaderRule();
-    uint8_t err=RTC_Init_LSE(); if(err){OLED_ShowChar(0,0,10);OLED_ShowChar(8,0,err);while(1){LED_TOGGLE();delay(500000);}}
-    rtc_debug_rcc_csr=RCC_CSR; rtc_debug_prer=RTC_PRER;
+    uint8_t err=DS3231_Init(); ds3231_last_error=err; if(err){OLED_ShowChar(0,0,10);OLED_ShowChar(8,0,err);while(1){LED_TOGGLE();delay(500000);}}
     uint8_t last_sec=0xFF,last_day=0xFF,setting=0,asleep=0,item=0,last_blink=0xFF;
     uint8_t edit_y=0,edit_mo=1,edit_da=1,edit_wd=1,edit_h=0,edit_mi=0,edit_se=0,edit_se_changed=0;
     uint32_t last_key_sample=0;
+    DS3231Calendar current={26,10,18,1,16,20,0};
     static ButtonState wake_button, set_button;
     while(1) {
-        uint32_t tr,dr,ssr;
+        uint32_t tr,dr;
         uint8_t y,mo,da,wd,h,mi,se;
-        RTC_ReadSnapshot(&tr,&dr,&ssr);
-        rtc_debug_ssr=ssr;
+        if (DS3231_ReadCalendar(&current)) ds3231_last_error=0;
+        else ds3231_last_error=6;
+        DS3231_ToDisplay(&current,&tr,&dr);
         RTC_DecodeSnapshot(tr,dr,&y,&mo,&da,&wd,&h,&mi,&se);
         uint32_t now=g_ms;
         uint8_t wake_evt=0,set_evt=0;
@@ -454,7 +400,9 @@ int main(void) {
             } else if(item>=6) {
                 OLED_ClearQueue();
                 setting=0; item=0;
-                RTC_WriteCalendar(edit_y,edit_mo,edit_da,edit_wd,edit_h,edit_mi,edit_se_changed?edit_se:se);
+                current=(DS3231Calendar){edit_y,edit_mo,edit_da,edit_wd,edit_h,edit_mi,edit_se_changed?edit_se:se};
+                if (!DS3231_WriteCalendar(&current)) ds3231_last_error=7;
+                else ds3231_last_error=0;
                 last_sec=0xFF; last_day=0xFF; OLED_ResetRendered();
             } else { item++; last_blink=0xFF; }
         }
